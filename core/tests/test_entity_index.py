@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import unicodedata
 from pathlib import Path
@@ -42,6 +43,28 @@ def _kwargs(vault: dict[str, Path]) -> dict[str, Path]:
         "people_index_path": vault["people_export"],
         "company_index_path": vault["company_export"],
     }
+
+
+def _verify_kwargs(vault: dict[str, Path]) -> dict[str, Path]:
+    return {
+        "people_index_path": vault["people_export"],
+        "company_index_path": vault["company_export"],
+    }
+
+
+class _StatWithMtime:
+    """stat_result-like object overriding only nanosecond mtime."""
+
+    def __init__(self, real: os.stat_result, mtime_ns: int) -> None:
+        self._real = real
+        self.st_mtime_ns = mtime_ns
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._real, name)
+
+
+def _stat_with_mtime_ns(result: os.stat_result, mtime_ns: int) -> _StatWithMtime:
+    return _StatWithMtime(result, mtime_ns)
 
 
 def _write_person(vault: dict[str, Path], name: str = "Alice Smith") -> Path:
@@ -604,23 +627,29 @@ def test_reconcile_debounces_unchanged_tree_but_not_a_deletion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     person = _write_person(entity_vault)
-    calls = 0
-    original = entity_index._reconcile_open_database
+    publications = 0
+    original_dump = entity_index.dump_json_views
 
-    def counted(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return original(*args, **kwargs)
+    def counted_dump(*args, **kwargs):
+        nonlocal publications
+        publications += 1
+        return original_dump(*args, **kwargs)
 
-    monkeypatch.setattr(entity_index, "_reconcile_open_database", counted)
+    monkeypatch.setattr(entity_index, "dump_json_views", counted_dump)
 
-    entity_index.reconcile(entity_vault["root"], **_kwargs(entity_vault))
-    entity_index.reconcile(entity_vault["root"], **_kwargs(entity_vault))
-    assert calls == 1
+    # The second, unchanged reconcile still content-fingerprints the pages
+    # (that check is what makes silent equal-length swaps detectable) but must
+    # skip projection writes and export publication entirely.
+    first = entity_index.reconcile(entity_vault["root"], **_kwargs(entity_vault))
+    second = entity_index.reconcile(entity_vault["root"], **_kwargs(entity_vault))
+    assert first == {"added": 1, "changed": 0, "removed": 0}
+    assert second == {"added": 0, "changed": 0, "removed": 0}
+    assert publications == 1
 
     person.unlink()
-    entity_index.reconcile(entity_vault["root"], **_kwargs(entity_vault))
-    assert calls == 2
+    third = entity_index.reconcile(entity_vault["root"], **_kwargs(entity_vault))
+    assert third == {"added": 0, "changed": 0, "removed": 1}
+    assert publications == 2
 
 
 def test_busy_database_error_does_not_remove_the_index(
@@ -702,7 +731,7 @@ def test_reconcile_reads_and_parses_sources_before_write_transaction(
     _write_person(entity_vault)
     captured_connection: sqlite3.Connection | None = None
     original_connect = entity_index.connect
-    original_parse = entity_index.parse_entity_page
+    original_parse_content = entity_index.parse_entity_page_content
     original_read_bytes = Path.read_bytes
 
     def capture_connection(path: str | Path) -> sqlite3.Connection:
@@ -710,10 +739,13 @@ def test_reconcile_reads_and_parses_sources_before_write_transaction(
         captured_connection = original_connect(path)
         return captured_connection
 
-    def parse_outside_transaction(path: str | Path) -> dict[str, object]:
+    def parse_outside_transaction(
+        page_path: str | Path,
+        text: str,
+    ) -> dict[str, object]:
         assert captured_connection is not None
         assert captured_connection.in_transaction is False
-        return original_parse(path)
+        return original_parse_content(page_path, text)
 
     def read_outside_transaction(path: Path) -> bytes:
         if path.suffix == ".md":
@@ -722,7 +754,11 @@ def test_reconcile_reads_and_parses_sources_before_write_transaction(
         return original_read_bytes(path)
 
     monkeypatch.setattr(entity_index, "connect", capture_connection)
-    monkeypatch.setattr(entity_index, "parse_entity_page", parse_outside_transaction)
+    monkeypatch.setattr(
+        entity_index,
+        "parse_entity_page_content",
+        parse_outside_transaction,
+    )
     monkeypatch.setattr(Path, "read_bytes", read_outside_transaction)
 
     entity_index.build_from_vault(entity_vault["root"], **_kwargs(entity_vault))
@@ -912,3 +948,257 @@ def test_default_scan_respects_folder_path_remapping(tmp_path: Path) -> None:
     assert entity_index.find_company_by_domain(
         tmp_path, "mail.engines.test"
     )["path"] == "Relationships/Accounts/Analytical_Engines.md"
+
+
+def _generation_triplet(vault: dict[str, Path]) -> tuple[str, str, str]:
+    db_path = entity_index.database_path(vault["root"])
+    with entity_index.connect(db_path) as connection:
+        db_generation = connection.execute(
+            "SELECT value FROM meta WHERE key = 'generation_id'"
+        ).fetchone()[0]
+    people_generation = json.loads(vault["people_export"].read_text())["generation_id"]
+    company_generation = json.loads(
+        vault["company_export"].read_text()
+    )["generation_id"]
+    return db_generation, people_generation, company_generation
+
+
+def test_equal_length_same_mtime_swap_reaches_nodes_edges_and_exports(
+    entity_vault: dict[str, Path],
+) -> None:
+    alice = _write_person(entity_vault)
+    _write_company(entity_vault)
+    original = alice.read_text(encoding="utf-8")
+    frontmatter = yaml.safe_load(original.split("---", 2)[1])
+    frontmatter["relationships"] = [
+        {
+            "type": "works_at",
+            "target": "[[Acme]]",
+            "status": "suggested",
+            "source": {"kind": "domain-match", "id": "acme.test"},
+            "date": "2026-07-23",
+        }
+    ]
+    body = original.split("---", 2)[2]
+    alice.write_text(
+        f"---\n{yaml.safe_dump(frontmatter, sort_keys=False).rstrip()}\n---{body}",
+        encoding="utf-8",
+    )
+    alice_id = alice.relative_to(entity_vault["root"]).as_posix()
+    company_id = (
+        entity_vault["companies"] / "Acme.md"
+    ).relative_to(entity_vault["root"]).as_posix()
+
+    entity_index.build_from_vault(entity_vault["root"], **_kwargs(entity_vault))
+    db_path = entity_index.database_path(entity_vault["root"])
+    with entity_index.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT dst_id, dst_ref FROM edges WHERE src_id = ?",
+            (alice_id,),
+        ).fetchall() == [(company_id, "[[Acme]]")]
+
+    # Equal-length byte swaps (role value and the edge target) with size and
+    # mtime_ns deliberately restored to their pre-swap values.
+    before = alice.stat()
+    swapped = (
+        alice.read_bytes()
+        .replace(b"VP Product", b"VP Prodcct", 1)
+        .replace(b"[[Acme]]", b"[[Bcme]]", 1)
+    )
+    assert len(swapped) == before.st_size
+    alice.write_bytes(swapped)
+    os.utime(alice, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert (alice.stat().st_size, alice.stat().st_mtime_ns) == (
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+    result = entity_index.reconcile(entity_vault["root"], **_kwargs(entity_vault))
+
+    assert result == {"added": 0, "changed": 1, "removed": 0}
+    with entity_index.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT role FROM nodes WHERE id = ?",
+            (alice_id,),
+        ).fetchone() == ("VP Prodcct",)
+        assert connection.execute(
+            "SELECT dst_id, dst_ref FROM edges WHERE src_id = ?",
+            (alice_id,),
+        ).fetchall() == [(None, "[[Bcme]]")]
+
+    people_export = json.loads(entity_vault["people_export"].read_text())
+    assert people_export["people"][0]["role"] == "VP Prodcct"
+    db_generation, people_generation, company_generation = _generation_triplet(
+        entity_vault
+    )
+    assert db_generation == people_generation == company_generation
+    assert entity_index.verify_generation(
+        entity_vault["root"], **_verify_kwargs(entity_vault)
+    )
+    match = entity_index.lookup_person(
+        entity_vault["root"], "Alice Smith", **_kwargs(entity_vault)
+    )
+    assert match["matches"][0]["role"] == "VP Prodcct"
+
+
+def test_stable_read_retries_after_an_in_flight_change_then_projects(
+    entity_vault: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    person = _write_person(entity_vault)
+    real_stat = Path.stat
+    tick = {"n": 0}
+
+    def flaky_stat(self: Path):
+        result = real_stat(self)
+        if self == person and tick["n"] < 3:
+            tick["n"] += 1
+            return _stat_with_mtime_ns(result, result.st_mtime_ns + tick["n"])
+        return result
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+    monkeypatch.setattr(entity_index.time, "sleep", sleeps.append)
+
+    result = entity_index.build_from_vault(
+        entity_vault["root"], **_kwargs(entity_vault)
+    )
+
+    assert result == {"added": 1, "changed": 0, "removed": 0}
+    assert sleeps == [entity_index.STABLE_READ_BACKOFF_SECONDS]
+    db_path = entity_index.database_path(entity_vault["root"])
+    with entity_index.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT quarantined FROM source_files"
+        ).fetchone() == (0,)
+        assert connection.execute("SELECT role FROM nodes").fetchone() == (
+            "VP Product",
+        )
+
+
+def test_persistently_changing_page_is_quarantined_without_torn_content(
+    entity_vault: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    person = _write_person(entity_vault)
+    real_stat = Path.stat
+    tick = {"n": 0}
+
+    def always_changing_stat(self: Path):
+        result = real_stat(self)
+        if self == person:
+            tick["n"] += 1
+            return _stat_with_mtime_ns(result, result.st_mtime_ns + tick["n"])
+        return result
+
+    monkeypatch.setattr(Path, "stat", always_changing_stat)
+    monkeypatch.setattr(entity_index.time, "sleep", lambda _seconds: None)
+
+    entity_index.build_from_vault(entity_vault["root"], **_kwargs(entity_vault))
+
+    db_path = entity_index.database_path(entity_vault["root"])
+    with entity_index.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT quarantined FROM source_files"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT status, role, company FROM nodes"
+        ).fetchone() == ("quarantined", None, None)
+        assert connection.execute("SELECT COUNT(*) FROM node_keys").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM edges").fetchone() == (0,)
+    people_export = json.loads(entity_vault["people_export"].read_text())
+    entry = people_export["people"][0]
+    assert entry["status"] == "quarantined"
+    assert entry["emails"] == []
+    assert entity_index.verify_generation(
+        entity_vault["root"], **_verify_kwargs(entity_vault)
+    )
+
+    match = entity_index.lookup_person(
+        entity_vault["root"], "Alice Smith", **_kwargs(entity_vault)
+    )
+    assert match["matches"][0]["status"] == "quarantined"
+    assert match["matches"][0]["emails"] == []
+
+
+def test_generation_split_is_detected_and_republishes_even_without_content_change(
+    entity_vault: dict[str, Path],
+) -> None:
+    _write_person(entity_vault)
+    entity_index.build_from_vault(entity_vault["root"], **_kwargs(entity_vault))
+    db_path = entity_index.database_path(entity_vault["root"])
+    previous_generation, _, _ = _generation_triplet(entity_vault)
+    assert entity_index.verify_generation(
+        entity_vault["root"], **_verify_kwargs(entity_vault)
+    )
+
+    # Simulate a crash after SQLite committed a new generation but before either
+    # JSON export was renamed into place.
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE meta SET value = 'sqlite-ahead' WHERE key = 'generation_id'"
+        )
+        connection.commit()
+    assert not entity_index.verify_generation(
+        entity_vault["root"], **_verify_kwargs(entity_vault)
+    )
+
+    # Content is untouched: healing must not depend on a content change or on
+    # force=True.
+    entity_index.reconcile(entity_vault["root"], **_kwargs(entity_vault))
+
+    db_generation, people_generation, company_generation = _generation_triplet(
+        entity_vault
+    )
+    assert db_generation == people_generation == company_generation
+    assert db_generation not in {previous_generation, "sqlite-ahead"}
+    assert entity_index.verify_generation(
+        entity_vault["root"], **_verify_kwargs(entity_vault)
+    )
+
+
+def test_split_generation_is_healed_on_the_reader_path(
+    entity_vault: dict[str, Path],
+) -> None:
+    _write_person(entity_vault)
+    entity_index.build_from_vault(entity_vault["root"], **_kwargs(entity_vault))
+
+    # Simulate a crash after one export was renamed but before the other.
+    people_payload = json.loads(entity_vault["people_export"].read_text())
+    people_payload["generation_id"] = "json-ahead"
+    entity_vault["people_export"].write_text(json.dumps(people_payload))
+    assert not entity_index.verify_generation(
+        entity_vault["root"], **_verify_kwargs(entity_vault)
+    )
+
+    view = entity_index.people_index_data(
+        entity_vault["root"], **_kwargs(entity_vault)
+    )
+
+    assert entity_index.verify_generation(
+        entity_vault["root"], **_verify_kwargs(entity_vault)
+    )
+    disk_generation = json.loads(
+        entity_vault["people_export"].read_text()
+    )["generation_id"]
+    assert view["generation_id"] == disk_generation
+    assert disk_generation != "json-ahead"
+
+
+def test_verify_generation_rejects_exports_without_marker(
+    entity_vault: dict[str, Path],
+) -> None:
+    _write_person(entity_vault)
+    entity_index.build_from_vault(entity_vault["root"], **_kwargs(entity_vault))
+    legacy = {
+        key: value
+        for key, value in json.loads(
+            entity_vault["company_export"].read_text()
+        ).items()
+        if key != "generation_id"
+    }
+    entity_vault["company_export"].write_text(json.dumps(legacy))
+
+    assert not entity_index.verify_generation(
+        entity_vault["root"], **_verify_kwargs(entity_vault)
+    )

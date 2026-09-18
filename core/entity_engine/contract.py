@@ -410,10 +410,16 @@ def _infer_type(path: Path, values: dict[str, Any]) -> str | None:
     return None
 
 
-def parse_entity_page(path: str | Path) -> dict[str, Any]:
-    """Parse a page using frontmatter, pipe-table, then inline-bold precedence."""
-    page_path = Path(path)
-    text = page_path.read_text(encoding="utf-8-sig")
+def parse_entity_page_content(
+    page_path: str | Path,
+    text: str,
+) -> dict[str, Any]:
+    """Parse already-loaded page text.
+
+    Parsing the exact bytes the reader holds (instead of re-opening the file)
+    keeps parsing immune to a second read/write race.
+    """
+    page_path = Path(page_path)
     frontmatter, body, had_frontmatter, quarantined = _split_frontmatter(text)
     pipe, inline, legacy_formats = _legacy_fields(body)
     result = _empty_result()
@@ -468,6 +474,13 @@ def parse_entity_page(path: str | Path) -> dict[str, Any]:
             else page_path.stem.replace("_", " ")
         )
     return result
+
+
+def parse_entity_page(path: str | Path) -> dict[str, Any]:
+    """Parse a page using frontmatter, pipe-table, then inline-bold precedence."""
+    page_path = Path(path)
+    text = page_path.read_text(encoding="utf-8-sig")
+    return parse_entity_page_content(page_path, text)
 
 
 def _yaml_safe(value: Any) -> Any:

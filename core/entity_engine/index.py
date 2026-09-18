@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import tempfile
 import time
 import unicodedata
+import uuid
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,9 +18,10 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterable, TypeVar
 
-from core.entity_engine.contract import fold, parse_entity_page
+from core.entity_engine.contract import fold, parse_entity_page_content
 from core.lifecycle.inventory import load_folder_map
 from core.paths import COMPANIES_DIR, PEOPLE_DIR, VAULT_ROOT
+from core.transaction.fsync import fsync_directory
 from core.utils.company_domains import registrable_domain
 
 # Vault-relative PARA roots derived from the canonical core.paths constants
@@ -30,6 +34,8 @@ _COMPANIES_REL = COMPANIES_DIR.relative_to(VAULT_ROOT).as_posix()
 
 SCHEMA_VERSION = "2"
 DEFAULT_DEBOUNCE_SECONDS = 0.25
+STABLE_READ_ATTEMPTS = 3
+STABLE_READ_BACKOFF_SECONDS = 0.01
 _DATABASE_RELATIVE_PATH = Path("System/.dex/entity-index/database.sqlite3")
 _PEOPLE_EXPORT_RELATIVE_PATH = Path("System/People_Index.json")
 _COMPANY_EXPORT_RELATIVE_PATH = Path("System/Company_Index.json")
@@ -115,6 +121,12 @@ class _FailedQuickCheck(sqlite3.DatabaseError):
     pass
 
 
+class _UnstableSource(OSError):
+    """A source file kept changing across every stable-read attempt."""
+
+    bytes_read: bytes = b""
+
+
 @dataclass(frozen=True)
 class _Source:
     path: Path
@@ -135,8 +147,11 @@ class _PreparedSource:
 
 @dataclass(frozen=True)
 class _CacheEntry:
+    # (path, content fingerprint, size, mtime_ns). The fingerprint closes the
+    # equal-length/same-mtime swap hole; size/mtime still notice touch-only
+    # changes so a utime-only change republishes during the debounce window.
     expires_at: float
-    signature: tuple[tuple[str, int, int], ...]
+    signature: tuple[tuple[str, str, int, int], ...]
 
 
 _RECONCILE_CACHE: dict[Path, _CacheEntry] = {}
@@ -296,6 +311,66 @@ def _scan_sources(
 
 def _fingerprint(content: bytes) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+def _read_stable_bytes(path: Path) -> bytes:
+    """Read a page only while size/mtime are unchanged across the read.
+
+    Stat-before-read versus stat-after-read detects a writer racing the read,
+    which would otherwise let half-old/half-new bytes enter the projection. The
+    read is retried a bounded number of times; persistent instability raises
+    ``_UnstableSource`` so the caller quarantines the page instead of trusting
+    torn bytes.
+    """
+    last_content = b""
+    for attempt in range(STABLE_READ_ATTEMPTS):
+        try:
+            before = path.stat()
+            content = path.read_bytes()
+            after = path.stat()
+        except OSError as error:
+            if isinstance(error, FileNotFoundError):
+                raise
+            raise _UnstableSource(str(error)) from error
+        last_content = content
+        if (
+            before.st_size == after.st_size
+            and before.st_mtime_ns == after.st_mtime_ns
+            and len(content) == after.st_size
+        ):
+            return content
+        if attempt + 1 < STABLE_READ_ATTEMPTS:
+            time.sleep(STABLE_READ_BACKOFF_SECONDS * (attempt + 1))
+    error = _UnstableSource(
+        f"file changed during every read attempt ({STABLE_READ_ATTEMPTS}): {path}"
+    )
+    error.bytes_read = last_content
+    raise error
+
+
+def _prepare_source(source: _Source) -> _PreparedSource:
+    """Stable-read, fingerprint, and parse one page; quarantine unsafe reads."""
+    try:
+        content = _read_stable_bytes(source.path)
+    except _UnstableSource as error:
+        return _PreparedSource(
+            source=source,
+            content=error.bytes_read,
+            fingerprint=_fingerprint(error.bytes_read),
+            parsed={"quarantined": True},
+        )
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        parsed: dict[str, Any] = {"quarantined": True}
+    else:
+        parsed = parse_entity_page_content(source.path, text)
+    return _PreparedSource(
+        source=source,
+        content=content,
+        fingerprint=_fingerprint(content),
+        parsed=parsed,
+    )
 
 
 def _person_compatibility_entry(
@@ -644,20 +719,31 @@ def _compatibility_rows(
     return rows
 
 
-def _built_at(connection: sqlite3.Connection) -> str:
+def _meta_value(connection: sqlite3.Connection, key: str) -> str | None:
     row = connection.execute(
-        "SELECT value FROM meta WHERE key = 'built_at'"
+        "SELECT value FROM meta WHERE key = ?",
+        (key,),
     ).fetchone()
-    return row[0] if row else datetime.now().isoformat()
+    return row[0] if row else None
+
+
+def _built_at(connection: sqlite3.Connection) -> str:
+    return _meta_value(connection, "built_at") or datetime.now().isoformat()
+
+
+def _generation_id(connection: sqlite3.Connection) -> str | None:
+    return _meta_value(connection, "generation_id")
 
 
 def _views(connection: sqlite3.Connection) -> tuple[dict[str, Any], dict[str, Any]]:
     built_at = _built_at(connection)
+    generation_id = _generation_id(connection)
     people = _compatibility_rows(connection, "person")
     companies = _compatibility_rows(connection, "company")
     people_view = {
         "version": 2,
         "built_at": built_at,
+        "generation_id": generation_id,
         "total": len(people),
         "by_type": {
             "internal": sum(item["type"] == "internal" for item in people),
@@ -669,6 +755,7 @@ def _views(connection: sqlite3.Connection) -> tuple[dict[str, Any], dict[str, An
     company_view = {
         "version": 1,
         "built_at": built_at,
+        "generation_id": generation_id,
         "total": len(companies),
         "companies": companies,
     }
@@ -676,10 +763,82 @@ def _views(connection: sqlite3.Connection) -> tuple[dict[str, Any], dict[str, An
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Durably replace one export: temp file + fsync + atomic rename.
+
+    A reader never observes a partially written export, and the rename survives
+    a crash once the parent-directory entry is fsynced.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, indent=2) + "\n",
-        encoding="utf-8",
+    data = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+    fsync_directory(path.parent)
+
+
+def _export_generation_id(path: str | Path) -> str | None:
+    """Return the committed-generation marker embedded in one JSON export."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    generation = payload.get("generation_id") if isinstance(payload, dict) else None
+    return generation if isinstance(generation, str) and generation else None
+
+
+def verify_generation(
+    vault_root: str | Path,
+    *,
+    people_index_path: str | Path | None = None,
+    company_index_path: str | Path | None = None,
+    connection: sqlite3.Connection | None = None,
+) -> bool:
+    """True iff SQLite and both JSON exports share one committed generation.
+
+    Publishing commits SQLite first and atomically renames the exports after,
+    so a crash during publish can leave a split generation, never a torn file.
+    A mismatch (or any missing marker) is observable here and forces a republish
+    on the next reconcile instead of serving mixed-generation reads.
+    """
+    root = Path(vault_root)
+    people_path = (
+        Path(people_index_path)
+        if people_index_path is not None
+        else root / _PEOPLE_EXPORT_RELATIVE_PATH
+    )
+    company_path = (
+        Path(company_index_path)
+        if company_index_path is not None
+        else root / _COMPANY_EXPORT_RELATIVE_PATH
+    )
+
+    def database_generation(open_connection: sqlite3.Connection) -> str | None:
+        return _generation_id(open_connection)
+
+    if connection is not None:
+        db_generation = database_generation(connection)
+    else:
+        with closing(connect(database_path(root))) as open_connection:
+            db_generation = database_generation(open_connection)
+    people_generation = _export_generation_id(people_path)
+    company_generation = _export_generation_id(company_path)
+    return (
+        bool(db_generation)
+        and db_generation == people_generation == company_generation
     )
 
 
@@ -713,8 +872,11 @@ def _reconcile_open_database(
     vault_root: Path,
     sources: dict[str, _Source],
     *,
+    db_path: str | Path,
     people_index_path: str | Path | None,
     company_index_path: str | Path | None,
+    force: bool = False,
+    debounce_seconds: float = DEFAULT_DEBOUNCE_SECONDS,
 ) -> dict[str, int]:
     with connection:
         _initialize_schema(connection)
@@ -724,37 +886,59 @@ def _reconcile_open_database(
             "SELECT path, fingerprint, size, mtime_ns FROM source_files"
         )
     }
-    current_paths = set(sources)
+
+    # Every page is stable-read, fingerprinted, and parsed OUTSIDE the write
+    # transaction. Content fingerprints (never size/mtime alone) decide change:
+    # an equal-length byte swap that preserves mtime is still detected. Pages
+    # that cannot be read stably are quarantined instead of projected.
+    prepared: dict[str, _PreparedSource] = {}
+    for relative_path in sorted(sources):
+        try:
+            prepared[relative_path] = _prepare_source(sources[relative_path])
+        except FileNotFoundError:
+            # Vanished between scan and read: it falls out of the path set and
+            # is treated as a removal below.
+            pass
+
+    signature = tuple(
+        (
+            relative_path,
+            candidate.fingerprint,
+            candidate.source.size,
+            candidate.source.mtime_ns,
+        )
+        for relative_path, candidate in sorted(prepared.items())
+    )
+    cache_key = Path(db_path).resolve()
+    if not force:
+        cached = _RECONCILE_CACHE.get(cache_key)
+        coherent = verify_generation(
+            vault_root,
+            people_index_path=people_index_path,
+            company_index_path=company_index_path,
+            connection=connection,
+        )
+        if (
+            cached is not None
+            and cached.expires_at >= time.monotonic()
+            and cached.signature == signature
+            and coherent
+        ):
+            return {"added": 0, "changed": 0, "removed": 0}
+
+    current_paths = set(prepared)
     indexed_paths = set(indexed)
     removed = indexed_paths - current_paths
     added = current_paths - indexed_paths
     present = current_paths & indexed_paths
-    changed = 0
+    changed_paths = {
+        relative_path
+        for relative_path in present
+        if prepared[relative_path].fingerprint != indexed[relative_path][0]
+    }
+    unchanged_paths = present - changed_paths
     indexed_at = datetime.now().isoformat()
-    prepared: dict[str, _PreparedSource] = {}
-
-    for relative_path in sorted(added):
-        source = sources[relative_path]
-        content = source.path.read_bytes()
-        prepared[relative_path] = _PreparedSource(
-            source=source,
-            content=content,
-            fingerprint=_fingerprint(content),
-            parsed=parse_entity_page(source.path),
-        )
-    for relative_path in sorted(present):
-        source = sources[relative_path]
-        _old_fingerprint, old_size, old_mtime_ns = indexed[relative_path]
-        # Accepted risk: unchanged size and mtime skip re-hashing on normal filesystems.
-        if (source.size, source.mtime_ns) == (old_size, old_mtime_ns):
-            continue
-        content = source.path.read_bytes()
-        prepared[relative_path] = _PreparedSource(
-            source=source,
-            content=content,
-            fingerprint=_fingerprint(content),
-            parsed=parse_entity_page(source.path),
-        )
+    generation_id = uuid.uuid4().hex
 
     with connection:
         connection.executemany(
@@ -767,33 +951,28 @@ def _reconcile_open_database(
                 prepared[relative_path],
                 indexed_at=indexed_at,
             )
-        for relative_path in sorted(present):
-            candidate = prepared.get(relative_path)
-            if candidate is None:
-                continue
-            source = candidate.source
-            old_fingerprint, old_size, old_mtime_ns = indexed[relative_path]
-            if candidate.fingerprint == old_fingerprint:
-                connection.execute(
-                    """
-                    UPDATE source_files
-                    SET size = ?, mtime_ns = ?, indexed_at = ?
-                    WHERE path = ?
-                    """,
-                    (
-                        source.size,
-                        source.mtime_ns,
-                        indexed_at,
-                        relative_path,
-                    ),
-                )
-                continue
+        for relative_path in sorted(changed_paths):
             _project_source(
                 connection,
-                candidate,
+                prepared[relative_path],
                 indexed_at=indexed_at,
             )
-            changed += 1
+        connection.executemany(
+            """
+            UPDATE source_files
+            SET size = ?, mtime_ns = ?, indexed_at = ?
+            WHERE path = ?
+            """,
+            [
+                (
+                    prepared[relative_path].source.size,
+                    prepared[relative_path].source.mtime_ns,
+                    indexed_at,
+                    relative_path,
+                )
+                for relative_path in sorted(unchanged_paths)
+            ],
+        )
         _resolve_edge_destinations(connection)
         connection.execute(
             """
@@ -802,14 +981,33 @@ def _reconcile_open_database(
             """,
             (indexed_at,),
         )
+        connection.execute(
+            """
+            INSERT INTO meta(key, value) VALUES ('generation_id', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (generation_id,),
+        )
 
+    # SQLite (with the new generation marker) is committed before either export
+    # is renamed into place. A crash here can split the generation, but can
+    # never expose a coherent-but-partial publication; verify_generation sees
+    # the split and the next reconcile republishes.
     dump_json_views(
         connection,
         vault_root,
         people_index_path=people_index_path,
         company_index_path=company_index_path,
     )
-    return {"added": len(added), "changed": changed, "removed": len(removed)}
+    _RECONCILE_CACHE[cache_key] = _CacheEntry(
+        expires_at=time.monotonic() + debounce_seconds,
+        signature=signature,
+    )
+    return {
+        "added": len(added),
+        "changed": len(changed_paths),
+        "removed": len(removed),
+    }
 
 
 def reconcile(
@@ -854,20 +1052,6 @@ def reconcile(
         people_dir=people_dir,
         companies_dir=companies_dir,
     )
-    signature = tuple(
-        (path, source.size, source.mtime_ns)
-        for path, source in sorted(sources.items())
-    )
-    cache_key = db_path.resolve()
-    cached = _RECONCILE_CACHE.get(cache_key)
-    if (
-        not force
-        and db_path.exists()
-        and cached is not None
-        and cached.expires_at >= time.monotonic()
-        and cached.signature == signature
-    ):
-        return {"added": 0, "changed": 0, "removed": 0}
 
     try:
         with closing(connect(db_path)) as connection:
@@ -875,8 +1059,11 @@ def reconcile(
                 connection,
                 root,
                 sources,
+                db_path=db_path,
                 people_index_path=people_index_path,
                 company_index_path=company_index_path,
+                force=force,
+                debounce_seconds=debounce_seconds,
             )
     except sqlite3.Error as error:
         if not _is_corruption(error):
@@ -887,14 +1074,13 @@ def reconcile(
                 connection,
                 root,
                 sources,
+                db_path=db_path,
                 people_index_path=people_index_path,
                 company_index_path=company_index_path,
+                force=force,
+                debounce_seconds=debounce_seconds,
             )
 
-    _RECONCILE_CACHE[cache_key] = _CacheEntry(
-        expires_at=time.monotonic() + debounce_seconds,
-        signature=signature,
-    )
     return result
 
 
@@ -924,13 +1110,28 @@ def _read_after_reconcile(
     reader: Callable[[sqlite3.Connection], _T],
 ) -> _T:
     db_path = database_path(vault_root)
+    verification_kwargs = {
+        key: reconcile_kwargs.get(key)
+        for key in ("people_index_path", "company_index_path")
+    }
     try:
         with closing(connect(db_path)) as connection:
-            return reader(connection)
+            if verify_generation(
+                vault_root,
+                connection=connection,
+                **verification_kwargs,
+            ):
+                return reader(connection)
     except sqlite3.Error as error:
         if not _is_corruption(error):
             raise
         remove_database(db_path)
+        reconcile(vault_root, force=True, **reconcile_kwargs)
+        with closing(connect(db_path)) as connection:
+            return reader(connection)
+    else:
+        # Split generation (typically a crash mid-publish): force one republish
+        # so SQLite and both exports share a committed generation before reads.
         reconcile(vault_root, force=True, **reconcile_kwargs)
         with closing(connect(db_path)) as connection:
             return reader(connection)
@@ -971,9 +1172,14 @@ def people_index_data(
             else Path(vault_root) / _PEOPLE_EXPORT_RELATIVE_PATH
         )
         try:
-            return json.loads(export_path.read_text(encoding="utf-8"))
+            fallback = json.loads(export_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             raise error
+        # Only serve an export the commit-and-rename protocol actually
+        # published; a marker-less file cannot be verified as any generation.
+        if not isinstance(fallback.get("generation_id"), str):
+            raise error
+        return fallback
 
 
 def company_index_data(
@@ -1011,9 +1217,12 @@ def company_index_data(
             else Path(vault_root) / _COMPANY_EXPORT_RELATIVE_PATH
         )
         try:
-            return json.loads(export_path.read_text(encoding="utf-8"))
+            fallback = json.loads(export_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             raise error
+        if not isinstance(fallback.get("generation_id"), str):
+            raise error
+        return fallback
 
 
 def lookup_person(
